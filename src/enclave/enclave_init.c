@@ -106,9 +106,10 @@ static int startmain(void* args)
     /* Indicate that libc initialization has finished */
     sgxlkl_enclave_state.libc_state = libc_initialized;
 
-    /* Ask OE to generate TLS certificate and private key */
-    enclave_generate_tls_credentials(
-        &cert, &cert_size, &private_key, &private_key_size);
+    /* In hw mode, ask OE to generate TLS certificate and private key */
+    if (!sgxlkl_in_sw_debug_mode())
+        enclave_generate_tls_credentials(
+            &cert, &cert_size, &private_key, &private_key_size);
 
     /* Setup LKL (hd, net, memory) and start kernel */
 
@@ -122,13 +123,14 @@ static int startmain(void* args)
     find_and_mount_disks();
 
     /* Save TLS certificate and private key to files. */
-    sgxlkl_write_tls_credentials(
-        cert,
-        cert_size,
-        private_key,
-        private_key_size,
-        SGXLKL_TLS_CERT_PATH,
-        SGXLKL_TLS_PRIVATE_KEY_PATH);
+    if (!sgxlkl_in_sw_debug_mode())
+        sgxlkl_write_tls_credentials(
+            cert,
+            cert_size,
+            private_key,
+            private_key_size,
+            SGXLKL_TLS_CERT_PATH,
+            SGXLKL_TLS_PRIVATE_KEY_PATH);
 
     /* Launch stage 3 dynamic linker, passing in top of stack to overwrite.
      * The dynamic linker will then load the application proper; here goes! */
