@@ -2,6 +2,7 @@
 APP_ROOT=app
 PROG=${APP_ROOT}/helloworld
 PROG_NONPIE=${APP_ROOT}/helloworld-nonpie
+PROG_NONCON=${APP_ROOT}/helloworld-noncon
 PROG_C=helloworld.c
 
 DISK_IMAGE=sgxlkl-helloworld.img
@@ -16,7 +17,7 @@ SGXLKL_STARTER=$(SGXLKL_ROOT)/build/sgx-lkl-run-oe
 ifeq ($(SGXLKL_VERBOSE),)
 SGXLKL_ENV=\
    SGXLKL_VERBOSE=1 SGXLKL_KERNEL_VERBOSE=0 SGXLKL_TRACE_SIGNAL=0\
-   SGXLKL_TRACE_HOST_SYSCALL=0 SGXLKL_TRACE_LKL_SYSCALL=0 SGXLKL_TRACE_MMAP=0
+   SGXLKL_TRACE_HOST_SYSCALL=1 SGXLKL_TRACE_LKL_SYSCALL=1 SGXLKL_TRACE_MMAP=1
 else
 SGXLKL_ENV=
 endif
@@ -30,16 +31,20 @@ SGXLKL_GDB=${SGXLKL_ROOT}/tools/gdb/sgx-lkl-gdb
 all: $(DISK_IMAGE)
 
 clean:
-	rm -f $(DISK_IMAGE) $(PROG) $(PROG_NONPIE)
+	rm -f $(DISK_IMAGE) $(PROG) $(PROG_NONPIE) $(PROG_NONCON)
 
 $(PROG): $(PROG_C)
-	${MUSL_CC} -fPIE -pie -o $@ $(PROG_C)
+	${MUSL_CC} -O3 -fPIE -pie -o $@ $(PROG_C)
 
 # non-PIE executable are currently unsupported by SGX-LKL-OE
 $(PROG_NONPIE): $(PROG_C)
-	${MUSL_CC} -fno-pie -no-pie -o $@ $(PROG_C)
+	${MUSL_CC} -O3 -fno-pie -no-pie -o $@ $(PROG_C)
 
-$(DISK_IMAGE): $(PROG) $(PROG_NONPIE)
+$(PROG_NONCON): $(PROG_C)
+	gcc -O3 -o $@ $(PROG_C)
+
+
+$(DISK_IMAGE): $(PROG) $(PROG_NONPIE) $(PROG_NONCON)
 	${SGXLKL_DISK_TOOL} create --size=${IMAGE_SIZE} --copy=./${APP_ROOT}/ ${DISK_IMAGE}
 
 run: run-hw

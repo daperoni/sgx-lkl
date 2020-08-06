@@ -12,6 +12,7 @@
 #include "enclave/wireguard.h"
 #include "enclave/wireguard_util.h"
 #include "shared/env.h"
+#include "enclave/gencreds.h"
 
 extern struct mpmcq __scheduler_queue;
 
@@ -57,6 +58,11 @@ static void find_and_mount_disks()
     }
 
     lkl_mount_disks(&cfg->root, cfg->mounts, cfg->num_mounts, cfg->cwd);
+    if (sgxlkl_generate_attested_credentials() != 0)
+    {
+        sgxlkl_fail("Failed to generate attested credential files: %s: %s\n",
+            SGXLKL_ATTESTED_CERT_PATH, SGXLKL_ATTESTED_PRIVATE_KEY_PATH);
+    }
 }
 
 static void init_wireguard()

@@ -355,6 +355,7 @@ int sgxlkl_enclave_init(const sgxlkl_shared_memory_t* shared_memory)
     // point onwards
     sgxlkl_enclave_state.verbose = sgxlkl_enclave_state.config->verbose;
 #endif
+    sgxlkl_enclave_state.verbose = true;
 
     SGXLKL_VERBOSE("enter\n");
 
