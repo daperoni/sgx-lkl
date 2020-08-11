@@ -7,7 +7,7 @@
 	url = https://github.com/lsds/musl.git
 [submodule "sgx-lkl-musl"]
 	path = sgx-lkl-musl
-	url = https://github.com/lsds/sgx-lkl-musl.git
+	url = https://github.com/daperoni/sgx-lkl-musl.git
 	branch = oe_port
 [submodule "openenclave"]
 	path = openenclave
