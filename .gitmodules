@@ -8,7 +8,7 @@
 [submodule "sgx-lkl-musl"]
 	path = sgx-lkl-musl
 	url = https://github.com/daperoni/sgx-lkl-musl.git
-	branch = oe_port
+	branch = perf-tests
 [submodule "openenclave"]
 	path = openenclave
 	url = https://github.com/openenclave/openenclave.git
