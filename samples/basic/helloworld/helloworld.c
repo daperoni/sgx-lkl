@@ -14,9 +14,9 @@
 #define BENCH_ITERATIONS 100000
 #define DEFAULT_BLOCK_SIZE 128
 
-//#ifndef SIZE
-//	#define SIZE 16
-//#endif
+#ifndef SIZE
+	#define SIZE 16
+#endif
 
 #define ENCLAVE_HOLESIZE (1024*1024)
 #ifdef ENCLAVE_HOLESIZE
