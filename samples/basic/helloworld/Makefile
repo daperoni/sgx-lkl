@@ -14,12 +14,18 @@ MUSL_CC=${SGXLKL_ROOT}/build/host-musl/bin/musl-gcc
 
 SGXLKL_STARTER=$(SGXLKL_ROOT)/build/sgx-lkl-run-oe
 
+CFLAGS=
+
 ifeq ($(SGXLKL_VERBOSE),)
 SGXLKL_ENV=\
    SGXLKL_VERBOSE=1 SGXLKL_KERNEL_VERBOSE=0 SGXLKL_TRACE_SIGNAL=0\
    SGXLKL_TRACE_HOST_SYSCALL=1 SGXLKL_TRACE_LKL_SYSCALL=1 SGXLKL_TRACE_MMAP=1
 else
 SGXLKL_ENV=
+endif
+
+ifdef SIZE
+CFLAGS += -DSIZE=$(SIZE)
 endif
 
 SGXLKL_DISK_TOOL=${SGXLKL_ROOT}/tools/sgx-lkl-disk
@@ -34,14 +40,14 @@ clean:
 	rm -f $(DISK_IMAGE) $(PROG) $(PROG_NONPIE) $(PROG_NONCON)
 
 $(PROG): $(PROG_C)
-	${MUSL_CC} -O3 -fPIE -pie -o $@ $(PROG_C)
+	${MUSL_CC} -O3 -fPIE -pie -o $@ $(PROG_C) $(CFLAGS)
 
 # non-PIE executable are currently unsupported by SGX-LKL-OE
 $(PROG_NONPIE): $(PROG_C)
-	${MUSL_CC} -O3 -fno-pie -no-pie -o $@ $(PROG_C)
+	${MUSL_CC} -O3 -fno-pie -no-pie -o $@ $(PROG_C) $(CFLAGS)
 
 $(PROG_NONCON): $(PROG_C)
-	gcc -O3 -o $@ $(PROG_C)
+	gcc -O3 -o $@ $(PROG_C) $(CFLAGS)
 
 
 $(DISK_IMAGE): $(PROG) $(PROG_NONPIE) $(PROG_NONCON)

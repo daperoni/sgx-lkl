@@ -14,7 +14,10 @@
 #define BENCH_ITERATIONS 100000
 #define DEFAULT_BLOCK_SIZE 128
 
-#define SIZE 1
+//#ifndef SIZE
+//	#define SIZE 16
+//#endif
+
 #define ENCLAVE_HOLESIZE (1024*1024)
 #ifdef ENCLAVE_HOLESIZE
 static char hole[SIZE][ENCLAVE_HOLESIZE] = {0};
