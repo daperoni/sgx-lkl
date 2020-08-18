@@ -47,6 +47,8 @@
 #include "host/host_device_ifc.h"
 #include "host/sgxlkl_u.h"
 
+#include <sys/time.h>
+
 #if defined(DEBUG)
 #define BUILD_INFO "[DEBUG build (-O0)]"
 #elif defined(SGXLKL_RELEASE)
@@ -1367,6 +1369,8 @@ void _create_enclave(
 
     char* buffer = NULL;
     size_t buffer_size = 0;
+    long long secs_used, nanos_used;
+    struct timespec start, end;
 
     serialize_enclave_config(
         &sgxlkl_host_state.enclave_config, &buffer, &buffer_size);
@@ -1375,8 +1379,18 @@ void _create_enclave(
     oe_create_eeid_sgx(buffer_size, &eeid);
     sgxlkl_enclave_config_t* econf = &sgxlkl_host_state.enclave_config;
     oe_enclave_size_settings_t oe_sizes = {
-        .num_heap_pages = econf->image_sizes.num_heap_pages,
-        .num_stack_pages = econf->image_sizes.num_stack_pages,
+        //.num_heap_pages = econf->image_sizes.num_heap_pages,
+        //.num_heap_pages = 524288,
+        .num_heap_pages = 262144,
+        //.num_heap_pages = 131072,
+        //.num_heap_pages = 65536,
+        //.num_heap_pages = 32768,
+        //.num_heap_pages = 16384,
+        //.num_heap_pages = 8192,
+        //.num_heap_pages = 1024,
+        //.num_stack_pages = econf->image_sizes.num_stack_pages,
+        .num_stack_pages = 1024,
+ 
 #ifdef DEBUG
         // Add extra TCS in DEBUG build to support ecall for dumping stack
         // traces
@@ -1391,10 +1405,15 @@ void _create_enclave(
 
     setting.u.eeid = eeid;
 
+    clock_gettime(CLOCK_MONOTONIC, &start);
     result = oe_create_sgxlkl_enclave(
         libsgxlkl, OE_ENCLAVE_TYPE_SGX, oe_flags, &setting, 1, oe_enclave);
-
+    clock_gettime(CLOCK_MONOTONIC, &end);
     free(eeid);
+
+    secs_used=(end.tv_sec - start.tv_sec); //avoid overflow by subtracting first
+    nanos_used= ((secs_used*1000000000) + end.tv_nsec) - (start.tv_nsec);
+	sgxlkl_host_verbose_raw("Time taken to create enclave=%ld ms\n", (nanos_used/1000000));
 
     sgxlkl_host_verbose_raw("result=%u (%s)\n", result, oe_result_str(result));
 
