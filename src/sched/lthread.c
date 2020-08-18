@@ -36,7 +36,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pthread_impl.h"
 #include "stdio_impl.h"
 
 #include <enclave/enclave_mem.h>
@@ -46,7 +45,6 @@
 #include "enclave/lthread_int.h"
 #include "enclave/sgxlkl_t.h"
 #include "enclave/ticketlock.h"
-#include "shared/tree.h"
 #include "openenclave/corelibc/oemalloc.h"
 
 #include "openenclave/corelibc/oemalloc.h"
@@ -55,17 +53,23 @@
 
 extern int vio_enclave_wakeup_event_channel(void);
 
-int __init_utp(void*, int);
-void* __copy_utls(struct lthread*, uint8_t*, size_t);
 static void _exec(void* lt);
 static void _lthread_init(struct lthread* lt);
 static void _lthread_lock(struct lthread* lt);
 static void lthread_rundestructors(struct lthread* lt);
 
-static void dummy_0()
+#define TLS_ALIGN 16
+
+static int spawned_ethreads = 1;
+
+void init_ethread_tp()
 {
+	struct schedctx *td = __scheduler_self();
+	td->self = td;
+	// Prevent collisions with lthread TIDs which are assigned to newly spawned
+	// lthreads incrementally, starting from one.
+	td->tid = INT_MAX - a_fetch_add(&spawned_ethreads, 1);
 }
-weak_alias(dummy_0, __do_orphaned_stdio_locks);
 
 static inline int _lthread_sleep_cmp(struct lthread* l1, struct lthread* l2);
 
@@ -78,16 +82,8 @@ static inline int _lthread_sleep_cmp(struct lthread* l1, struct lthread* l2)
     return (1);
 }
 
-RB_GENERATE(lthread_rb_sleep, lthread, sleep_node, _lthread_sleep_cmp);
-
 static int spawned_lthreads = 1;
 static _Atomic(bool) _lthread_should_stop = false;
-
-static struct ticketlock sleeplock;
-int _lthread_sleeprb_inited = 0;
-struct lthread_rb_sleep _lthread_sleeping;
-
-static size_t nsleepers = 0;
 
 static size_t sleepspins = 500000000;
 static size_t sleeptime_ns = 1600;
@@ -95,6 +91,7 @@ static size_t futex_wake_spins = 500;
 static volatile int schedqueuelen = 0;
 
 int thread_count = 1;
+
 #if DEBUG
 struct lthread_queue* __active_lthreads = NULL;
 struct lthread_queue* __active_lthreads_tail = NULL;
@@ -191,20 +188,17 @@ void __schedqueue_inc()
     a_inc(&schedqueuelen);
 }
 
-void lthread_sched_global_init(
-    size_t sleepspins_,
-    size_t sleeptime_ns_)
+void lthread_sched_global_init(size_t sleepspins_, size_t sleeptime_ns_)
 {
     sleepspins = sleepspins_;
     sleeptime_ns = sleeptime_ns_;
     futex_wake_spins = DEFAULT_FUTEX_WAKE_SPINS;
-    RB_INIT(&_lthread_sleeping);
 }
 
 void lthread_notify_completion(void)
 {
     SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] lthread_notify_completion. \n", lthread_self()->tid);
+        "[%4d] lthread_notify_completion\n", lthread_self()->tid);
     _lthread_should_stop = true;
 }
 
@@ -243,7 +237,7 @@ void lthread_run(void)
                 pauses = sleepspins;
                 a_dec(&schedqueuelen);
                 SGXLKL_TRACE_THREAD(
-                    "[tid=%-3d] lthread_run(): lthread_resume (dequeue)\n",
+                    "[%4d] lthread_run(): lthread_resume (dequeue)\n",
                     lt ? lt->tid : -1);
                 _lthread_resume(lt);
             }
@@ -281,38 +275,33 @@ void lthread_run(void)
         if (_lthread_should_stop)
         {
             SGXLKL_TRACE_THREAD(
-                "[tid=%-3d] lthread_run(): quitting\n", lt ? lt->tid : -1);
+                "[%4d] lthread_run(): quitting\n", lt ? lt->tid : -1);
             break;
         }
     }
 }
 
 /*
- * Removes lthread from sleeping rbtree.
+ * Changes lthread state from sleeping to ready.
  * This can be called multiple times on the same lthread regardless if it was
  * sleeping or not.
  */
 void _lthread_desched_sleep(struct lthread* lt)
 {
-    ticket_lock(&sleeplock);
     SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] _lthread_desched_sleep() TICKET_LOCK lock=SLEEPLOCK tid=%d "
+        "[%4d] _lthread_desched_sleep() TICKET_LOCK lock=SLEEPLOCK tid=%d "
         "\n",
         (lthread_self() ? lthread_self()->tid : 0),
         lt->tid);
     if (lt->attr.state & BIT(LT_ST_SLEEPING))
     {
-        RB_REMOVE(lthread_rb_sleep, &_lthread_sleeping, lt);
         lt->attr.state &= CLEARBIT(LT_ST_SLEEPING);
-        lt->attr.state |= BIT(LT_ST_READY);
         lt->attr.state &= CLEARBIT(LT_ST_EXPIRED);
-        nsleepers--;
+        lt->attr.state |= BIT(LT_ST_READY);
     }
 
-    ticket_unlock(&sleeplock);
-
     SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] _lthread_desched_sleep() TICKET_UNLOCK lock=SLEEPLOCK "
+        "[%4d] _lthread_desched_sleep() TICKET_UNLOCK lock=SLEEPLOCK "
         "tid=%d\n",
         (lthread_self() ? lthread_self()->tid : 0),
         lt->tid);
@@ -336,6 +325,10 @@ static void _lthread_lock(struct lthread* lt)
 static void _lthread_unlock(struct lthread* lt)
 {
     a_barrier();
+
+    // We should never unlock an lthread that is not locked.
+    SGXLKL_ASSERT(lt->attr.state & BIT(LT_ST_BUSY));
+
     lt->attr.state &= CLEARBIT(LT_ST_BUSY);
 }
 
@@ -355,44 +348,21 @@ void _lthread_yield(struct lthread* lt)
 
 void _lthread_free(struct lthread* lt)
 {
-    volatile void* volatile* rp;
-    while (lt->cancelbuf)
-    {
-        void (*f)(void*) = lt->cancelbuf->__f;
-        void* x = lt->cancelbuf->__x;
-        lt->cancelbuf = lt->cancelbuf->__next;
-        f(x);
-    }
     if (lthread_self() != NULL)
         lthread_rundestructors(lt);
-    if (lt->itls != 0)
+    
+    // lthread only manages tls region for lkl kernel threads
+    if (lt->attr.thread_type == LKL_KERNEL_THREAD && lt->itls != 0)
     {
         enclave_munmap(lt->itls, lt->itlssz);
     }
-    while ((rp = lt->robust_list.head) && rp != &lt->robust_list.head)
-    {
-        pthread_mutex_t* m =
-            (void*)((char*)rp - offsetof(pthread_mutex_t, _m_next));
-        int waiters = m->_m_waiters;
-        lt->robust_list.pending = rp;
-        lt->robust_list.head = *rp;
-        int cont = a_swap(&m->_m_lock, lt->tid | 0x40000000);
-        lt->robust_list.pending = 0;
-        if (cont < 0 || waiters) {
-            enclave_futex_wake((int*)&m->_m_lock, 1);
-        }
-    }
-    __do_orphaned_stdio_locks(lt);
+
     if (lt->attr.stack)
     {
         enclave_munmap(lt->attr.stack, lt->attr.stack_size);
         lt->attr.stack = NULL;
     }
     oe_memset_s(lt, sizeof(*lt), 0, sizeof(*lt));
-    if (a_fetch_add(&libc.threads_minus_1, -1) == 0)
-    {
-        libc.threads_minus_1 = 0;
-    }
 
 #if DEBUG
     if (__active_lthreads != NULL && __active_lthreads->lt == lt)
@@ -429,18 +399,16 @@ void _lthread_free(struct lthread* lt)
     lthread_dealloc(lt);
 }
 
-void set_tls_tp(struct lthread* lt)
+static void init_tp(struct lthread *lt, unsigned char *mem, size_t sz)
 {
-    if (!libc.user_tls_enabled || !lt->itls)
-        return;
+	mem += sz - sizeof(struct lthread_tcb_base);
+	mem -= (uintptr_t)mem & (TLS_ALIGN - 1);
+	lt->tp = mem;
+	struct lthread_tcb_base *tcb = (struct lthread_tcb_base *)mem;
+	tcb->self = mem;
+}
 
-    uintptr_t tp_unaligned =
-        (uintptr_t)(lt->itls + lt->itlssz - sizeof(struct lthread_tcb_base));
-    struct lthread_tcb_base* tp =
-        (struct
-         lthread_tcb_base*)(tp_unaligned - (tp_unaligned & (libc.tls_align - 1)));
-
-    tp->schedctx = __scheduler_self();
+static void set_fsbase(void* tp){
 
     if (!sgxlkl_in_sw_debug_mode())
     {
@@ -448,56 +416,43 @@ void set_tls_tp(struct lthread* lt)
     }
     else
     {
-        int r = __set_thread_area(TP_ADJ(tp));
-        if (r < 0)
+        int res;
+        __asm__ volatile(
+            "mov %1, %%rsi\n\t"
+            "movl $0x1002, %%edi\n\t"       /* SET_FS register */
+            "movl $158, %%eax\n\t"          /* set fs segment to */
+            "syscall"                       /* arch_prctl(SET_FS, arg)*/
+            : "=a" (res)
+            : "r" (tp)
+        );
+        if (res < 0)
         {
-            sgxlkl_fail("Could not set thread area %p\n", tp);
+            sgxlkl_fail( "Could not set thread area %p\n", tp);
         }
     }
+}
+void set_tls_tp(struct lthread* lt)
+{
+    if (!lt->tp)
+        return;
+    set_fsbase(lt->tp);
 }
 
 void reset_tls_tp(struct lthread* lt)
 {
-    if (!libc.user_tls_enabled || !lt->itls)
+    if (!lt->tp)
         return;
 
     struct schedctx* sp = __scheduler_self();
 
-    // The scheduler context is at a fixed offset from its ethread's fsbase.
+    // The scheduler context is at a fixed offset from its ethread's gsbase.
     char* tp = (char*)sp - SCHEDCTX_OFFSET;
-
-    if (!sgxlkl_in_sw_debug_mode())
-    {
-        __asm__ volatile("wrfsbase %0" ::"r"(tp));
-    }
-    else
-    {
-        int r = __set_thread_area(TP_ADJ(tp));
-        if (r < 0)
-        {
-            sgxlkl_fail("Could not set thread area %p: %s\n", tp);
-        }
-    }
+    set_fsbase(tp);
 }
 
 int _lthread_resume(struct lthread* lt)
 {
     struct lthread_sched* sched = lthread_get_sched();
-    if (lt->attr.state & BIT(LT_ST_CANCELLED))
-    {
-        /* if an lthread was joining on it, schedule it to run */
-        if (lt->lt_join)
-        {
-            __scheduler_enqueue(lt->lt_join);
-            lt->lt_join = NULL;
-        }
-        /* if lthread is detached, then we can free it up */
-        if (lt->attr.state & BIT(LT_ST_DETACH))
-        {
-            _lthread_free(lt);
-        }
-        return (-1);
-    }
 
     if (lt->attr.state & BIT(LT_ST_NEW))
         _lthread_init(lt);
@@ -510,6 +465,18 @@ int _lthread_resume(struct lthread* lt)
 
     set_tls_tp(lt);
     _switch(&lt->ctx, &sched->ctx);
+    // The first "startmain" thread eventually loads the app's ELF image
+    // and initializes its tls area. As lthread has to properly set the
+    // tls region on context switches, check if the fs has changed and
+    // update the lthread's thread pointer field accordingly.
+    if (sched->current_lthread->tid == 1 &&
+        (sched->current_lthread)->attr.thread_type == LKL_KERNEL_THREAD){
+        void* fs_ptr;
+        __asm__ __volatile__("mov %%fs:0,%0" : "=r"(fs_ptr));
+        if (fs_ptr != sched->current_lthread->tp){
+            sched->current_lthread->tp = fs_ptr;
+        }
+    }
     sched->current_lthread = NULL;
     reset_tls_tp(lt);
 
@@ -574,28 +541,16 @@ int _lthread_sched_init(size_t stack_size)
 
     sched_stack_size = stack_size ? stack_size : MAX_STACK_SIZE;
 
-    struct schedctx* c = __scheduler_self();
+    struct lthread_sched* sched = lthread_get_sched();
 
-    c->sched.stack_size = sched_stack_size;
+    sched->stack_size = sched_stack_size;
 
-    c->sched.default_timeout = 3000000u;
+    sched->default_timeout = 3000000u;
 
     oe_memset_s(
-        &c->sched.ctx, sizeof(struct cpu_ctx), 0, sizeof(struct cpu_ctx));
+        &sched->ctx, sizeof(struct cpu_ctx), 0, sizeof(struct cpu_ctx));
 
     return (0);
-}
-
-static FILE* volatile dummy_file = 0;
-
-weak_alias(dummy_file, __stdin_used);
-weak_alias(dummy_file, __stdout_used);
-weak_alias(dummy_file, __stderr_used);
-
-static void init_file_lock(FILE* f)
-{
-    if (f && f->lock < 0)
-        f->lock = 0;
 }
 
 int lthread_create_primitive(
@@ -606,51 +561,25 @@ int lthread_create_primitive(
 {
     struct lthread* lt;
 
-    // FIXME: Remove when we no longer have lthread / libc layering issues.
-    if (!libc.threaded && libc.threads_minus_1 >= 0)
-    {
-        for (FILE* f = *__ofl_lock(); f; f = f->next)
-            init_file_lock(f);
-        __ofl_unlock();
-        init_file_lock(__stdin_used);
-        init_file_lock(__stdout_used);
-        init_file_lock(__stderr_used);
-        libc.threaded = 1;
-    }
-
-    if ((lt = lthread_alloc(1, sizeof(struct lthread))) == NULL)
+    if ((lt = oe_calloc(1, sizeof(struct lthread))) == NULL)
     {
         return -1;
     }
 
-    // FIXME: Once lthread / pthread layering is fixed, just use the tls
-    // argument as gs base.  We can't do that now because _lthread_free
-    // attempts to unmap this area.
-    lt->itlssz = libc.tls_size;
-    if (libc.tls_size)
-    {
-        if ((intptr_t)(lt->itls = (uint8_t*)enclave_mmap(
-                 0,
-                 lt->itlssz,
-                 0, /* map_fixed */
-                 PROT_READ | PROT_WRITE,
-                 1 /* zero_pages */)) < 0)
-        {
-            lthread_dealloc(lt);
-            return -1;
-        }
-        if (__init_utp(__copy_utls(lt, lt->itls, lt->itlssz), 0))
-        {
-            lthread_dealloc(lt);
-            return -1;
-        }
-    }
-    LIST_INIT(&lt->tls);
-    lt->locale = &libc.global_locale;
+    // For USERSPACE_THREADS created via clone(), lthread doesn't manage the
+    // tls region(stored in lt->itls, not be confused by lt->tls, which is similar
+    // to key based tsd in pthreads)
+    // Also for these threads, the tls pointer passed to this function is the
+    // pointer to the thread's control block. So we save it here in lt->tp for
+    // setting up fsbase on a context switch.
+    size_t* tp = tls;
+    SGXLKL_ASSERT(tp[0] == (size_t)tls); // check if tls self pointer is set
+    lt->tp = tls;
 
+    LIST_INIT(&lt->tls);
     lt->attr.state = BIT(LT_ST_READY);
+    lt->attr.thread_type = USERSPACE_THREAD;
     lt->tid = a_fetch_add(&spawned_lthreads, 1);
-    lt->robust_list.head = &lt->robust_list.head;
 
     static unsigned long long n = 0;
     oe_snprintf(
@@ -664,10 +593,7 @@ int lthread_create_primitive(
         *new_lt = lt;
     }
 
-    a_inc(&libc.threads_minus_1);
-
-    SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] create: thread_count=%d\n", lt->tid, thread_count);
+    SGXLKL_TRACE_THREAD("[%4d] create: count=%d\n", lt->tid, thread_count);
 
 #if DEBUG
     struct lthread_queue* new_ltq =
@@ -705,30 +631,21 @@ int lthread_create(
     size_t stack_size;
     struct lthread_sched* sched = lthread_get_sched();
 
-    if (!libc.threaded && libc.threads_minus_1 >= 0)
+    if ((lt = oe_calloc(1, sizeof(struct lthread))) == NULL)
     {
-        for (FILE* f = *__ofl_lock(); f; f = f->next)
-            init_file_lock(f);
-        __ofl_unlock();
-        init_file_lock(__stdin_used);
-        init_file_lock(__stdout_used);
-        init_file_lock(__stderr_used);
-        libc.threaded = 1;
+        return -1;
     }
 
     stack_size =
         attrp && attrp->stack_size ? attrp->stack_size : sched->stack_size;
-    if ((lt = lthread_alloc(1, sizeof(struct lthread))) == NULL)
-    {
-        return -1;
-    }
     lt->attr.stack = attrp ? attrp->stack : 0;
-    if ((!lt->attr.stack) && ((intptr_t)(lt->attr.stack = enclave_mmap(
-                                   0,
-                                   stack_size,
-                                   0, /* map_fixed */
-                                   PROT_READ | PROT_WRITE,
-                                   1 /* zero_pages */)) < 0))
+    if ((!lt->attr.stack) && ((intptr_t)(
+                                  lt->attr.stack = enclave_mmap(
+                                      0,
+                                      stack_size,
+                                      0, /* map_fixed */
+                                      PROT_READ | PROT_WRITE,
+                                      1 /* zero_pages */)) < 0))
     {
         lthread_dealloc(lt);
         return -1;
@@ -736,34 +653,28 @@ int lthread_create(
     lt->attr.stack_size = stack_size;
 
     /* mmap tls image */
-    lt->itlssz = libc.tls_size;
-    if (libc.tls_size)
-    {
-        if ((intptr_t)(lt->itls = (uint8_t*)enclave_mmap(
+    // To maintain tls alignment, calculates
+    // closest multiple of TLS_ALIGN > sizeof(struct lthread_tcb_base)
+    lt->itlssz = (sizeof(struct lthread_tcb_base) + TLS_ALIGN - 1) & -TLS_ALIGN;
+    if ((lt->itls = (uint8_t*)enclave_mmap(
                  0,
                  lt->itlssz,
                  0, /* map_fixed */
                  PROT_READ | PROT_WRITE,
-                 1 /* zero_pages */)) < 0)
-        {
-            lthread_dealloc(lt);
-            return -1;
-        }
-        if (__init_utp(__copy_utls(lt, lt->itls, lt->itlssz), 0))
-        {
-            enclave_munmap(lt->attr.stack, stack_size);
-            lthread_dealloc(lt);
-            return -1;
-        }
+                 1 /* zero_pages */)) == MAP_FAILED)
+    {
+        oe_free(lt);
+        return -1;
     }
+    init_tp(lt, lt->itls, lt->itlssz);
 
     lt->attr.state = BIT(LT_ST_NEW) | (attrp ? attrp->state : 0);
+    lt->attr.thread_type = LKL_KERNEL_THREAD;
     lt->tid = a_fetch_add(&spawned_lthreads, 1);
     lt->fun = fun;
     lt->arg = arg;
-    lt->locale = &libc.global_locale;
+
     LIST_INIT(&lt->tls);
-    lt->robust_list.head = &lt->robust_list.head;
 
     // Inherit name from parent
     if (lthread_self() && lthread_self()->funcname)
@@ -776,10 +687,7 @@ int lthread_create(
         *new_lt = lt;
     }
 
-    a_inc(&libc.threads_minus_1);
-
-    SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] create: thread_count=%d\n", lt->tid, thread_count);
+    SGXLKL_TRACE_THREAD("[%4d] create: count=%d\n", lt->tid, thread_count);
 
 #if DEBUG
     struct lthread_queue* new_ltq =
@@ -806,18 +714,18 @@ struct lthread* lthread_current(void)
     return (lthread_get_sched()->current_lthread);
 }
 
-void lthread_cancel(struct lthread* lt)
+static inline void _lthread_desched_ready(void* _lt)
 {
-    if (lt == NULL)
-        return;
+    // Update lthread state to sleep.
+    struct lthread* lt = _lt;
+    lt->attr.state &= CLEARBIT(LT_ST_READY);
+    lt->attr.state |= BIT(LT_ST_SLEEPING);
+}
 
-    if (lt->attr.state & BIT(LT_ST_CANCELSTATE))
-    {
-        return;
-    }
-    lt->attr.state |= BIT(LT_ST_CANCELLED);
-    _lthread_desched_sleep(lt);
-    __scheduler_enqueue(lt);
+void lthread_yield_and_sleep(void)
+{
+    struct lthread* current_lt = lthread_self();
+    _lthread_yield_cb(current_lt, _lthread_desched_ready, current_lt);
 }
 
 void lthread_wakeup(struct lthread* lt)
@@ -835,8 +743,7 @@ void lthread_exit(void* ptr)
     /* switch thread to exiting state */
     _lthread_lock(lt);
 
-    SGXLKL_TRACE_THREAD(
-        "[tid=%-3d] thread_exit: thread_count=%d\n", lt->tid, thread_count);
+    SGXLKL_TRACE_THREAD("[%4d] thread_exit: count=%d\n", lt->tid, thread_count);
 
     lt->yield_cbarg = ptr;
     lt->attr.state |= BIT(LT_ST_EXITED);
@@ -857,36 +764,44 @@ int lthread_join(struct lthread* lt, void** ptr, uint64_t timeout)
     struct lthread* current = lthread_get_sched()->current_lthread;
     if (lt->attr.state & BIT(LT_ST_DETACH))
     {
+        SGXLKL_TRACE_THREAD(
+            "[%4d] join (detached): tid=%d count=%d\n",
+            (lthread_self() ? lthread_self()->tid : 0),
+            lt->tid,
+            thread_count);
         return EINVAL;
     }
     _lthread_lock(lt);
     if (lt->attr.state & BIT(LT_ST_EXITED))
     {
         SGXLKL_TRACE_THREAD(
-            "[tid=%-3d] join:  tid=%d count=%d\n",
+            "[%4d] join (exited): tid=%d count=%d\n",
             (lthread_self() ? lthread_self()->tid : 0),
             lt->tid,
             thread_count);
-
-        /* we can test for exited flag only with lock acquired */
-        _lthread_unlock(lt);
     }
     else
     {
         SGXLKL_TRACE_THREAD(
-            "[tid=%-3d] join:  tid=%d count=%d\n",
+            "[%4d] join (waiting): tid=%d count=%d\n",
             (lthread_self() ? lthread_self()->tid : 0),
             lt->tid,
             thread_count);
 
         /* thread is still running, set current lthread as joiner */
-        if (a_cas_p(&lt->lt_join, 0, current) != 0)
+        void* null_ptr = NULL;
+        if (!atomic_compare_exchange_strong(&lt->lt_join, &null_ptr, current) !=
+            0)
         {
             /* there already is a joiner */
             _lthread_unlock(lt);
             return EINVAL;
         }
         _lthread_yield_cb(current, (void*)_lthread_unlock, lt);
+
+        // Reacquire the lthread lock before we start freeing the lthread. It
+        // may still be exiting concurrently.
+        _lthread_lock(lt);
     }
     if (ptr)
     {
@@ -948,33 +863,13 @@ struct lthread* lthread_self(void)
     }
 }
 
-int lthread_setcancelstate(int new, int* old)
-{
-    if (new > 2U)
-        return EINVAL;
-    struct lthread* curr = lthread_get_sched()->current_lthread;
-    if (old)
-    {
-        *old = (curr->attr.state & BIT(LT_ST_CANCELSTATE)) > 0;
-    }
-    if (new)
-    {
-        curr->attr.state |= BIT(LT_ST_CANCELSTATE);
-    }
-    else
-    {
-        curr->attr.state &= ~BIT(LT_ST_CANCELSTATE);
-    }
-    return 0;
-}
-
 /**
  * Find the TLS slot for a specified lthread.  It is the caller's
  * responsibility to ensure that the specified lthread is not concurrently
  * accessed.  `lthread_current()` is always safe to use here as is any lthread
  * that has not yet been scheduled.
  */
-static struct lthread_tls* lthread_findtlsslot(struct lthread *lt, long key)
+static struct lthread_tls* lthread_findtlsslot(struct lthread* lt, long key)
 {
     struct lthread_tls *d, *d_tmp;
     LIST_FOREACH_SAFE(d, &lt->tls, tls_next, d_tmp)
@@ -1104,26 +999,90 @@ void lthread_set_expired(struct lthread* lt)
 }
 
 #ifdef DEBUG
-void lthread_dump_all_threads(void)
+
+#define STRINGIFY_LT_STATE(enum_lt_state)     \
+    if (state & BIT(LT_ST_##enum_lt_state))   \
+    {                                         \
+        str_len = sizeof(#enum_lt_state "|"); \
+        oe_strncpy_s(                         \
+            lt_state_str + offset,            \
+            size - offset,                    \
+            #enum_lt_state "|",               \
+            str_len);                         \
+        offset += str_len - 1;                \
+    }
+
+static void lthread_state_to_string(
+    struct lthread* lt,
+    char* lt_state_str,
+    const size_t size)
+{
+    int state = lt->attr.state;
+    size_t str_len = 0;
+    size_t offset = 0;
+
+    STRINGIFY_LT_STATE(NEW)
+    STRINGIFY_LT_STATE(READY)
+    STRINGIFY_LT_STATE(EXITED)
+    STRINGIFY_LT_STATE(BUSY)
+    STRINGIFY_LT_STATE(SLEEPING)
+    STRINGIFY_LT_STATE(EXPIRED)
+    STRINGIFY_LT_STATE(DETACH)
+    STRINGIFY_LT_STATE(PINNED)
+
+    lt_state_str[offset - 1] = '\0';
+}
+
+void lthread_dump_all_threads(bool is_lthread)
 {
     struct lthread_queue* lt_queue = __active_lthreads;
 
-    sgxlkl_info("=============================================================\n");
+    sgxlkl_info(
+        "=============================================================\n");
     sgxlkl_info("Stack traces for all lthreads:\n");
+
+    struct lthread* this_lthread = NULL;
+    char lt_state_str[1024] = "";
+
+    // Is this called from an lthread?
+    if (is_lthread)
+        this_lthread = lthread_self();
 
     for (int i = 1; lt_queue; i++)
     {
         struct lthread* lt = lt_queue->lt;
-        SGXLKL_ASSERT(lt);
-        int tid = lt->tid;
-        char* funcname = lt->funcname;
-        sgxlkl_info("-------------------------------------------------------------\n");
-        sgxlkl_info("%s%i: tid=%i [%s]\n", lt == lthread_self() ? "*" : "", i, tid, funcname);
-        sgxlkl_print_backtrace(lt == lthread_self() ? __builtin_frame_address(0) : lt->ctx.ebp);
+
+        // Do we have a valid lthread?
+        if (lt)
+        {
+            int tid = lt->tid;
+            char* funcname = lt->funcname;
+
+            lthread_state_to_string(lt, lt_state_str, 1024);
+
+            sgxlkl_info("------------------------------------------------------"
+                        "-------\n");
+            sgxlkl_info(
+                "%s%i: tid=%i (%p) [%s] (%s) %s\n",
+                lt == this_lthread ? "*" : "",
+                i,
+                tid,
+                lt,
+                funcname,
+                lt_state_str,
+                lt->lt_join ? "J" : "");
+            sgxlkl_print_backtrace(
+                lt == this_lthread ? __builtin_frame_address(0) : lt->ctx.ebp);
+        }
+        else
+        {
+            sgxlkl_info("%i: lt=NULL\n", i);
+        }
 
         lt_queue = lt_queue->next;
     }
 
-    sgxlkl_info("=============================================================\n");
+    sgxlkl_info(
+        "=============================================================\n");
 }
 #endif

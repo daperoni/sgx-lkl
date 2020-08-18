@@ -47,6 +47,7 @@
 #endif
 
 #include "enclave/enclave_util.h"
+#include "enclave/lthread.h"
 #include "enclave/sgxlkl_t.h"
 #include "enclave/wireguard.h"
 #include "enclave/wireguard_util.h"
@@ -861,7 +862,8 @@ void lkl_mount_disks(
     if (!root)
         sgxlkl_fail("No root disk provided. Aborting...\n");
 
-    lkl_add_disks(root, mounts, num_mounts);
+    if (lkl_add_disks(root, mounts, num_mounts) != 0)
+        sgxlkl_fail("Add root disk failed. Aborting...\n");
 
     lkl_mount_root_disk(root, 0);
 
@@ -1175,6 +1177,9 @@ static void* lkl_termination_thread(void* args)
         "Performed LKL syscall to get host task allocated (pid=%li)\n", pid);
     SGXLKL_ASSERT(pid);
 
+    lthread_set_funcname(lthread_self(), "sgx-lkl-terminate");
+    lthread_detach();
+
     /* Block on semaphore until shutdown */
     sgxlkl_host_ops.sem_down(termination_sem);
 
@@ -1210,7 +1215,7 @@ static void* lkl_termination_thread(void* args)
     }
 
     // Switch back to root so we can unmount all filesystems
-    SGXLKL_VERBOSE("calling lkl_sys_chdir(/)\n");
+    SGXLKL_VERBOSE("calling lkl_sys_chdir(\"/\")\n");
     int ret = lkl_sys_chdir("/");
     if (ret != 0)
     {
@@ -1226,7 +1231,7 @@ static void* lkl_termination_thread(void* args)
 
     // Unmount mounts
     long res;
-    for (int i = sgxlkl_enclave_state.num_disk_state - 1; i > 0; --i)
+    for (int i = cfg->num_mounts - 1; i >= 0; i--)
     {
         if (!sgxlkl_enclave_state.disk_state[i].mounted)
             continue;
@@ -1261,9 +1266,15 @@ static void* lkl_termination_thread(void* args)
         }
     }
 
-#ifdef DEBUG
-    display_mount_table();
-#endif
+    SGXLKL_VERBOSE("calling lkl_sys_sync()\n");
+    ret = lkl_sys_sync();
+    if (ret != 0)
+    {
+        sgxlkl_warn(
+            "lkl_sys_sync() failed: ret=%i error=\"%s\"\n",
+            ret,
+            lkl_strerror(ret));
+    }
 
     /* Unmount root.
      * We are calling umount with the MNT_DETACH flag for the root
@@ -1276,6 +1287,10 @@ static void* lkl_termination_thread(void* args)
     res = lkl_umount_timeout("/", MNT_DETACH, UMOUNT_DISK_TIMEOUT);
     if (res < 0)
         sgxlkl_warn("Could not unmount root disk, %s\n", lkl_strerror(res));
+
+#ifdef DEBUG
+    display_mount_table();
+#endif
 
     SGXLKL_VERBOSE("calling lkl_virtio_netdev_remove()\n");
     lkl_virtio_netdev_remove();
@@ -1293,15 +1308,7 @@ static void* lkl_termination_thread(void* args)
     /* Set termination flag to notify lthread scheduler to bail out. */
     lthread_notify_completion();
 
-    lthread_detach2(lthread_self());
-    SGXLKL_VERBOSE("lthread_detach2() done\n");
-
-    /* Free the shutdown semaphore late in the shutdown sequence */
-    sgxlkl_host_ops.sem_free(termination_sem);
-
-    sgxlkl_free_enclave_state();
-
-    lthread_exit(NULL);
+    return NULL;
 }
 
 /* Create the LKL termination thread */
@@ -1553,7 +1560,7 @@ extern inline int lkl_access_ok(unsigned long addr, unsigned long size)
     ret = oe_is_within_enclave((void*)addr, size);
     if (!ret)
     {
-        sgxlkl_fail("lkl_access_check failed: %p\n", (void*)addr);
+        SGXLKL_VERBOSE("lkl_access_check failed: %p\n", (void*)addr);
     }
     return ret;
 }

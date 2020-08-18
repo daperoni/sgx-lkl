@@ -32,7 +32,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -44,9 +43,7 @@
 
 #include "enclave/mpmc_queue.h"
 #include "shared/queue.h"
-#include "shared/tree.h"
 
-#define DEFINE_LTHREAD (lthread_set_funcname(__func__))
 #define CLOCK_LTHREAD CLOCK_REALTIME
 
 // Configures after how many scheduler cycles futexes are woken up
@@ -80,10 +77,13 @@ enum lthread_st
     LT_ST_SLEEPING,        /* lthread is sleeping */
     LT_ST_EXPIRED,         /* lthread has expired and needs to run */
     LT_ST_DETACH,          /* lthread frees when done, else it waits to join */
-    LT_ST_CANCELLED,       /* lthread has been cancelled */
-    LT_ST_CANCELSTATE,     /* lthread cancellation has been disabled */
-    LT_ST_CANCEL_DISABLED, /* lthread cancellation has been deferred */
     LT_ST_PINNED,          /* lthread pinned to ethread */
+};
+
+enum lthread_type
+{
+    USERSPACE_THREAD,
+    LKL_KERNEL_THREAD
 };
 
 struct lthread_tls
@@ -107,6 +107,7 @@ struct lthread_attr
     size_t stack_size;  /* current stack_size */
     _Atomic(int) state; /* current lthread state */
     void* stack;        /* ptr to lthread_stack */
+    int thread_type;    /* type of thread: usermode or lkl kernel */
 };
 
 typedef void (*sig_handler)(int sig, siginfo_t* si, void* unused);
@@ -134,36 +135,23 @@ struct lthread
     lthread_func fun;             /* func lthread is running */
     void* arg;                    /* func args passed to func */
     struct lthread_attr attr;     /* various attributes */
-    struct __ptcb* cancelbuf;     /* cancellation buffer */
     int tid;                      /* lthread id */
     char funcname[64];            /* optional func name */
     struct lthread* lt_join;      /* lthread we want to join on */
     void** lt_exit_ptr;           /* exit ptr for lthread_join */
-    locale_t locale;              /* locale of current lthread */
     uint32_t ops;                 /* num of ops since yield */
     uint64_t sleep_usecs;         /* how long lthread is sleeping */
-    FILE* stdio_locks;            /* locked files */
     struct lthread_tls_l tls;     /* pointer to TLS */
     uint8_t* itls;                /* image TLS */
     size_t itlssz;                /* size of TLS image */
-    RB_ENTRY(lthread) sleep_node; /* sleep tree node pointer */
+    uintptr_t* tp;                 /* thread pointer */
     int err;                      /* errno value */
-    char* dlerror_buf;
-    int dlerror_flag;
-    uintptr_t* dtv;
-    uintptr_t* dtv_copy;
     /* yield_cb_* are a callback to call after yield finished and it's arg */
     /* they are required to release futex lock on FUTEX_WAIT operation */
     /* and in sched_yield (see comment there) to avoid race among schedulers */
     void (*yield_cb)(void*);
     void* yield_cbarg;
     struct futex_q fq;
-    struct
-    {
-        volatile void* volatile head;
-        long off;
-        volatile void* volatile pending;
-    } robust_list;
 };
 
 struct lthread_queue
@@ -171,8 +159,6 @@ struct lthread_queue
     struct lthread* lt;
     struct lthread_queue* next;
 };
-
-RB_HEAD(lthread_rb_sleep, lthread);
 
 LIST_HEAD(lthread_l, lthread);
 TAILQ_HEAD(lthread_q, lthread);
@@ -186,12 +172,41 @@ struct lthread_sched
     /* convenience data maintained by lthread_resume */
     struct lthread* current_lthread;
 };
+/**
+ * lthread scheduler context. Pointer to this structure can be fetched by
+ * calling __scheduler_self(). 
+ * The structure is located towards the end of the page pointed by %gs.
+ */
+struct schedctx {
+	struct schedctx *self;
+	int tid;
+	struct lthread_sched sched;
+};
+
+/* Thread Control Block (TCB) for lthreads and lthread scheduler */
+struct lthread_tcb_base {
+    void *self;
+    char _pad_0[32];
+    // SGX-LKL does not have full stack smashing protection (SSP) support right
+    // now. In particular, we do not generate a random stack guard for every
+    // new thread. However, when aplications are compiled with stack protection
+    // enabled, GCC makes certain assumptions about the Thread Control Block
+    // (TCB) layout. Among other things, it expects a read-only stack
+    // guard/canary value at an offset 0x28 (40 bytes) from the FS segment
+    // base/start of the TCB (see schedctx struct above).
+    uint64_t stack_guard_dummy;
+    struct schedctx *schedctx;
+};
 
 typedef struct lthread* lthread_t;
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+    /**
+     * Initialisation of ethread/lthread scheduler thread pointer (schedctx).
+     */
+    void init_ethread_tp();
 
     void lthread_sched_global_init(
         size_t sleepspins,
@@ -220,8 +235,6 @@ extern "C"
         void* lthread_func,
         void* arg);
 
-    void lthread_cancel(struct lthread* lt);
-
     void lthread_notify_completion(void);
 
     bool lthread_should_stop(void);
@@ -236,6 +249,13 @@ extern "C"
 
     void lthread_exit(void* ptr) __attribute__((noreturn));
 
+    /**
+     * Yields to the scheduler and puts the current lthread to sleep by
+     * marking it as sleeping. The lthread can be added back to the scheduler
+     * queue by calling lthread_wakeup afterwards.
+     */
+    void lthread_yield_and_sleep(void);
+
     void lthread_wakeup(struct lthread* lt);
 
     int lthread_init(size_t size);
@@ -247,8 +267,6 @@ extern "C"
     uint64_t lthread_id();
 
     struct lthread* lthread_self(void);
-
-    int lthread_setcancelstate(int, int*);
 
     void lthread_set_expired(struct lthread* lt);
 
@@ -321,10 +339,14 @@ extern "C"
      * pointers saved by the lthread scheduler. It shows the stack traces
      * at the time of the last context switch.
      *
+     * The argument is_lthread should be set to true if the function is
+     * called from an lthread (and not a regular pthread, e.g. after an
+     * ecall).
+     *
      * For the current lthread (marked with a '*'), it prints the active
-     * stack frames.
+     * stack frames (if called from an lthread).
      */
-    void lthread_dump_all_threads(void);
+    void lthread_dump_all_threads(bool is_lthread);
 #endif
 
 #ifdef __cplusplus

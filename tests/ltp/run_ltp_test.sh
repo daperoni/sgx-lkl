@@ -28,7 +28,10 @@ case "$test_mode" in
 esac
 test_class="ltp"
 
-SGX_LKL_RUN_CMD=( "$SGXLKL_STARTER" $run_flag sgxlkl-miniroot-fs.img )
+SGXLKL_LTP_TSTAPP_CFG="--enclave-config=../ltp_tstapp_enclave_config.json"
+SGXLKL_LTP_HOST_CFG="--host-config=../ltp_host_config.json"
+
+SGX_LKL_RUN_CMD=( "$SGXLKL_STARTER" "$SGXLKL_LTP_HOST_CFG" "$SGXLKL_LTP_TSTAPP_CFG" $run_flag sgxlkl-miniroot-fs.img )
 
 csv_filename="sgxlkl_oe_ltp_test_result_$(date +%d%m%y_%H%M%S).csv"
 echo "SI No, Test Name, Stdout logfile name, Stderr logfile name, Execution Status" > "$csv_filename"
@@ -45,7 +48,7 @@ else
 fi
 
 # Set variables
-timeout=60
+timeout=120
 total_passed=0
 total_failed=0
 counter=0

@@ -106,6 +106,10 @@ __gdb_hook_starter_ready(void* base_addr, int mode, char* libsgxlkl_path)
 {
     __asm__ volatile("nop" : : "m"(base_addr), "m"(mode), "m"(libsgxlkl_path));
 }
+
+// Store enclave handle for use in DEBUG signal handler
+static oe_enclave_t* sgxlkl_enclave = NULL;
+
 #endif
 
 /**************************************************************************************************************************/
@@ -333,14 +337,28 @@ static void help_enclave_config()
     }
 }
 
-#if DEBUG && VIRTIO_TEST_HOOK
-/* Control the event channel notification between host & guest */
-
-/* Signal handler to resume paused evt chn to resume guest */
+#ifdef DEBUG
+// Signal handler for thread stack dumps and virtio event channel tests
 static void sgxlkl_loader_signal_handler(int signo)
 {
     switch (signo)
     {
+        case SIGTERM:
+            sgxlkl_host_verbose(
+                "Dumping thread stack traces from enclave (and aborting)...\n");
+
+            assert(sgxlkl_enclave);
+            sgxlkl_debug_dump_stack_traces(sgxlkl_enclave);
+            sgxlkl_host_fail("Aborting after stack trace dump\n");
+            break;
+        case SIGUSR1:
+            sgxlkl_host_verbose("Dumping thread stack traces from enclave (and "
+                                "not aborting)...\n");
+
+            assert(sgxlkl_enclave);
+            sgxlkl_debug_dump_stack_traces(sgxlkl_enclave);
+            break;
+#ifdef VIRTIO_TEST_HOOK
         case SIGUSR2:
             /* Dump the event channel status */
             vio_host_dump_evt_chn();
@@ -355,11 +373,12 @@ static void sgxlkl_loader_signal_handler(int signo)
             /* clear the pause flag */
             virtio_debug_set_evt_chn_state(false);
             break;
+#endif // VIRTIO_TEST_HOOK
         default:
-            sgxlkl_host_info("Handling not required\n");
+            sgxlkl_host_fail("Unknown signal received (signo=%i)\n", signo);
     }
 }
-#endif // DEBUG && VIRTIO_TEST_HOOK
+#endif // DEBUG
 
 static void prepare_verity(
     sgxlkl_enclave_root_config_t* disk,
@@ -587,8 +606,10 @@ void override_disk_config(const char* root_disk_path)
     }
 }
 
-void check_envs(const char** pres, char** envp, const char* warn_msg)
+void check_envs_all(char** envp)
 {
+#ifndef DEBUG
+    static const char* pres[] = {"SGXLKL_TRACE_", "SGXLKL_PRINT_"};
     char envname[128];
     for (char** env = envp; *env != 0; env++)
     {
@@ -603,21 +624,15 @@ void check_envs(const char** pres, char** envp, const char* warn_msg)
                     *env);
                 if (getenv_bool(envname, 0))
                 {
-                    fprintf(stderr, warn_msg, envname);
+                    fprintf(
+                        stderr,
+                        "[   SGX-LKL  ] Warning: %s ignored in non-debug "
+                        "mode.\n",
+                        envname);
                 }
             }
         }
     }
-}
-
-void check_envs_all(char** envp)
-{
-#ifndef DEBUG
-    const char* dbg_pres[] = {"SGXLKL_TRACE_", "SGXLKL_PRINT_"};
-    check_envs(
-        dbg_pres,
-        envp,
-        "[   SGX-LKL  ] Warning: %s ignored in non-debug mode.\n");
 #endif /* DEBUG */
 }
 
@@ -842,7 +857,7 @@ void set_tls(bool have_enclave_config)
         assert(econf->mode == SW_DEBUG_MODE);
         if (have_enclave_config && econf->fsgsbase != 0)
             sgxlkl_host_warn("disabling fsgsbase in sw-debug mode, despite it "
-                             "being enabled in enclave config.");
+                             "being enabled in enclave config.\n");
         econf->fsgsbase = 0;
     }
 
@@ -1375,7 +1390,13 @@ void _create_enclave(
         //.num_heap_pages = 1024,
         //.num_stack_pages = econf->image_sizes.num_stack_pages,
         .num_stack_pages = 1024,
+#ifdef DEBUG
+        // Add extra TCS in DEBUG build to support ecall for dumping stack
+        // traces
+        .num_tcs = econf->ethreads + 1,
+#else
         .num_tcs = econf->ethreads,
+#endif
     };
 
     eeid->size_settings = oe_sizes;
@@ -1397,6 +1418,11 @@ void _create_enclave(
 
     if (result != OE_OK)
         sgxlkl_host_fail("Could not initialise enclave\n");
+
+#ifdef DEBUG
+    // Make enclave handle available to DEBUG signal handler
+    sgxlkl_enclave = *oe_enclave;
+#endif
 }
 
 void find_root_disk_file(int* argc, char*** argv, char** root_hd)
@@ -1694,11 +1720,15 @@ int main(int argc, char* argv[], char* envp[])
 
     int c;
 
-#if DEBUG && VIRTIO_TEST_HOOK
+#ifdef DEBUG
+    signal(SIGUSR1, sgxlkl_loader_signal_handler);
+    signal(SIGTERM, sgxlkl_loader_signal_handler);
+#ifdef VIRTIO_TEST_HOOK
     signal(SIGUSR2, sgxlkl_loader_signal_handler);
     signal(SIGCONT, sgxlkl_loader_signal_handler);
     virtio_debug_init();
-#endif // DEBUG && VIRTIO_TEST_HOOK
+#endif // VIRTIO_TEST_HOOK
+#endif // DEBUG
 
     static struct option long_options[] = {
         {"sw-debug", no_argument, 0, SW_DEBUG_MODE},
