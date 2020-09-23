@@ -30,4 +30,3 @@ $(ROOT_FS): $(ALPINE_TAR) buildenv.sh
 	$(ESCALATE_CMD) install buildenv.sh $(MOUNTPOINT)/usr/sbin
 	$(ESCALATE_CMD) chroot $(MOUNTPOINT) /bin/sh /usr/sbin/buildenv.sh
 	$(ESCALATE_CMD) umount $(MOUNTPOINT)
-	$(ESCALATE_CMD) chown $(USER) "$@"

@@ -47,6 +47,8 @@
 #include "host/host_device_ifc.h"
 #include "host/sgxlkl_u.h"
 
+#include <sys/time.h>
+
 #if defined(DEBUG)
 #define BUILD_INFO "[DEBUG build (-O0)]"
 #elif defined(SGXLKL_RELEASE)
@@ -1395,6 +1397,10 @@ void _create_enclave(
     size_t buffer_size = 0;
     char path[PATH_MAX];
 
+    long long secs_used, nanos_used;
+    struct timespec start, end;
+ 
+
     serialize_enclave_config(
         &sgxlkl_host_state.enclave_config, &buffer, &buffer_size);
 
@@ -1425,10 +1431,15 @@ void _create_enclave(
         sgxlkl_host_fail("path overflow: %s:%s\n", libsgxlkl, libsgxlkl_user);
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &start);
     result = oe_create_sgxlkl_enclave(
         path, OE_ENCLAVE_TYPE_SGX, oe_flags, &setting, 1, oe_enclave);
 
+    clock_gettime(CLOCK_MONOTONIC, &end);
     free(eeid);
+    secs_used=(end.tv_sec - start.tv_sec); //avoid overflow by subtracting first
+    nanos_used= ((secs_used*1000000000) + end.tv_nsec) - (start.tv_nsec);
+	sgxlkl_host_verbose_raw("Time taken to initialize enclave=%ld ms\n", (nanos_used/1000000));
 
     sgxlkl_host_verbose_raw("result=%u (%s)\n", result, oe_result_str(result));
 
