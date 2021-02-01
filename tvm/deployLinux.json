@@ -1,0 +1,269 @@
+{
+  "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Username for the Virtual Machine."
+      }
+    },
+    "adminPublicKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Password for the Virtual Machine."
+      }
+    },
+    "osPublisher": {
+      "type": "string",
+      "metadata": {
+        "description": "The publisher of the version of Linux for the VM."
+      }
+    },
+    "osOffer": {
+      "type": "string",
+      "metadata": {
+        "description": "The offer of the version of Linux for the VM."
+      }
+    },
+    "osVersion": {
+      "type": "string",
+      "metadata": {
+        "description": "The Linux version for the VM. This will pick a fully patched image of this given Linux version."
+      }
+    },
+    "imageVersion": {
+      "type": "string",
+      "metadata": {
+        "description": "The the image version for the OS."
+      }
+    },
+    "vmName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the VM."
+      }
+    },
+    "osDiskType": {
+      "type": "string",
+      "defaultValue": "StandardSSD_LRS",
+      "allowedValues": [
+        "Premium_LRS",
+        "StandardSSD_LRS"
+      ]
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D2s_v3",
+      "metadata": {
+        "description": "Size of the virtual machine."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources."
+      }
+    },
+    "secureBoot": {
+      "type": "string",
+      "defaultValue": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "VTPM": {
+      "type": "string",
+      "defaultValue": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    }
+  },
+  "variables": {
+    "diagnosticsStorageAccountName": "[concat(uniquestring(resourceGroup().id), 'sawinvm')]",
+    "nicName": "[concat(parameters('vmName'), 'myVMNic')]",
+    "addressPrefix": "10.1.16.0/24",
+    "subnetName": "[concat(parameters('vmName'), 'Subnet')]",
+    "subnetPrefix": "10.1.16.0/24",
+    "publicIPAddressName": "[concat(parameters('vmName'), 'pubip')]",
+    "virtualNetworkName": "[concat(parameters('vmName'), 'vnet')]",
+    "nsgId": "[resourceId(resourceGroup().name, 'Microsoft.Network/networkSecurityGroups', variables('networkSecurityGroupName'))]",
+    "vnetId": "[resourceId(resourceGroup().name, 'Microsoft.Network/virtualNetworks', variables('virtualNetworkName'))]",
+    "subnetRef": "[concat(variables('vnetId'), '/subnets/', variables('subnetName'))]",
+    "networkSecurityGroupName": "default-NSG"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2019-06-01",
+      "name": "[variables('diagnosticsStorageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Premium_LRS"
+      },
+      "kind": "Storage",
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.Network/publicIpAddresses",
+      "apiVersion": "2019-02-01",
+      "name": "[variables('publicIpAddressName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Basic"
+      },
+      "properties": {
+        "publicIpAllocationMethod": "Dynamic"
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2019-07-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[concat('Microsoft.Network/networkSecurityGroups/', variables('networkSecurityGroupName'))]",
+        "[concat('Microsoft.Network/virtualNetworks/', variables('virtualNetworkName'))]",
+        "[concat('Microsoft.Network/publicIpAddresses/', variables('publicIpAddressName'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIpAddress": {
+                "id": "[resourceId(resourceGroup().name, 'Microsoft.Network/publicIpAddresses', variables('publicIpAddressName'))]"
+              },
+              "subnet": {
+                "id": "[variables('subnetRef')]"
+              }
+            }
+          }
+        ],
+        "networkSecurityGroup": {
+          "id": "[variables('nsgId')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2019-02-01",
+      "name": "[variables('networkSecurityGroupName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "RDP",
+            "properties": {
+              "priority": 300,
+              "protocol": "TCP",
+              "access": "Allow",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRanges": [ "3389", "22" ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2019-09-01",
+      "name": "[variables('virtualNetworkName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[variables('addressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "[variables('subnetPrefix')]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2020-06-01",
+      "name": "[parameters('vmName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/networkInterfaces/', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "securityProfile": {
+          "uefiSettings": {
+            "secureBootEnabled": "[parameters('secureBoot')]",
+            "vTPMEnabled": "[parameters('VTPM')]"
+          }
+        },
+        "osProfile": {
+          "computerName": "[parameters('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "linuxConfiguration": {
+				"disablePasswordAuthentication": true,
+				"ssh": {
+					"publicKeys": [
+						{
+							"path": "[concat('/home/', parameters('adminUsername'), '/.ssh/authorized_keys')]",
+							"keyData": "[parameters('adminPublicKey')]"
+						}
+					]
+				}
+			}
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[parameters('osPublisher')]",
+            "offer": "[parameters('osOffer')]",
+            "sku": "[parameters('osVersion')]",
+            "version": "[parameters('imageVersion')]"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "[parameters('osDiskType')]"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": false,
+            "storageUri": "[concat('https://', variables('diagnosticsStorageAccountName'), '.blob.core.windows.net/')]"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "adminUsername": {
+      "type": "string",
+      "value": "[parameters('adminUsername')]"
+    }
+  }
+}
