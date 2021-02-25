@@ -11,31 +11,7 @@
     "adminPublicKey": {
       "type": "securestring",
       "metadata": {
-        "description": "Password for the Virtual Machine."
-      }
-    },
-    "osPublisher": {
-      "type": "string",
-      "metadata": {
-        "description": "The publisher of the version of Linux for the VM."
-      }
-    },
-    "osOffer": {
-      "type": "string",
-      "metadata": {
-        "description": "The offer of the version of Linux for the VM."
-      }
-    },
-    "osVersion": {
-      "type": "string",
-      "metadata": {
-        "description": "The Linux version for the VM. This will pick a fully patched image of this given Linux version."
-      }
-    },
-    "imageVersion": {
-      "type": "string",
-      "metadata": {
-        "description": "The the image version for the OS."
+        "description": "Public key for the Virtual Machine."
       }
     },
     "vmName": {
@@ -81,7 +57,14 @@
         "true",
         "false"
       ]
-    }
+    },
+		"availabilitySetName": {
+		"type": "string",
+		"defaultValue": "daperoni-tvm-linux2_group-AVSET01",
+		"metadata": {
+        "description": "The availability set name."
+      }
+	}
   },
   "variables": {
     "diagnosticsStorageAccountName": "[concat(uniquestring(resourceGroup().id), 'sawinvm')]",
@@ -196,7 +179,7 @@
     },
     {
       "type": "Microsoft.Compute/virtualMachines",
-      "apiVersion": "2020-06-01",
+      "apiVersion": "2020-12-01",
       "name": "[parameters('vmName')]",
       "location": "[parameters('location')]",
       "identity": {
@@ -213,29 +196,30 @@
           "uefiSettings": {
             "secureBootEnabled": "[parameters('secureBoot')]",
             "vTPMEnabled": "[parameters('VTPM')]"
-          }
+          },
+		  "securityType": "TrustedLaunch"
         },
         "osProfile": {
           "computerName": "[parameters('vmName')]",
           "adminUsername": "[parameters('adminUsername')]",
-          "linuxConfiguration": {
-				"disablePasswordAuthentication": true,
-				"ssh": {
-					"publicKeys": [
-						{
-							"path": "[concat('/home/', parameters('adminUsername'), '/.ssh/authorized_keys')]",
-							"keyData": "[parameters('adminPublicKey')]"
-						}
-					]
-				}
-			}
+		  "linuxConfiguration": {
+		    "disablePasswordAuthentication": true,
+			  "ssh": {
+			    "publicKeys": [
+				  {
+				    "path": "[concat('/home/', parameters('adminUsername'), '/.ssh/authorized_keys')]",
+					"keyData": "[parameters('adminPublicKey')]"
+			      }
+                ]
+              }
+            }
         },
         "storageProfile": {
           "imageReference": {
-            "publisher": "[parameters('osPublisher')]",
-            "offer": "[parameters('osOffer')]",
-            "sku": "[parameters('osVersion')]",
-            "version": "[parameters('imageVersion')]"
+            "publisher": "Canonical",
+            "offer": "UbuntuServer",
+            "sku": "18_04-lts-gen2",
+            "version": "latest"
           },
           "osDisk": {
             "createOption": "FromImage",
@@ -250,6 +234,9 @@
               "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
             }
           ]
+        },
+		"availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', parameters('availabilitySetName'))]"
         },
         "diagnosticsProfile": {
           "bootDiagnostics": {
